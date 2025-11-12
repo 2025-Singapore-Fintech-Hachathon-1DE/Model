@@ -1,6 +1,23 @@
+# Data Processing
 pandas
 duckdb
-matplotlib
-seaborn
 numpy
 openpyxl
+xlrd
+
+# Visualization (existing)
+matplotlib
+seaborn
+
+# Web Dashboard
+dash>=2.14.0
+dash-bootstrap-components>=1.5.0
+plotly>=5.17.0
+
+# Network Visualization
+networkx>=3.2
+python-louvain
+
+# Additional utilities
+python-dateutil
+pytz
