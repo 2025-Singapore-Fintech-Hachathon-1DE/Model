@@ -268,7 +268,7 @@ class DataManager:
         return self._con
 
     # ---------------------- Persistent full/model workflow -----------------
-    def seed_full_and_model(self, year: int = 2025, month: int = 3, sheets: Optional[List[str]] = None):
+    def seed_full_and_model(self, year: int = 2025, month: int = 11, sheets: Optional[List[str]] = None):
         """Persist full sheet tables and create model-use tables seeded to a given month.
 
         - Writes each loaded sheet into a persistent table named

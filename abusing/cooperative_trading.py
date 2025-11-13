@@ -1,7 +1,13 @@
 """
 Cooperative Trading Detection System (공모거래 탐지 시스템)
-Version: 2.0
+Version: 2.1
 Author: Singapore Fintech Hackathon Team
+
+주요 개선 사항 (v2.1):
+1. PnL 계산 시 position_id 중복 제거 로직 추가
+   - 동일 position_id가 여러 거래 쌍에 나타날 수 있어 중복 집계 방지
+   - AD_2.py 로직 참고하여 개선
+2. SQL 쿼리 시간 계산 개선 (epoch 함수 사용)
 
 탐지 대상: 복수 계정 간 협력하여 부당 이득을 취하는 패턴
 - 동시 매매 패턴
@@ -294,13 +300,13 @@ class CandidateExtractor:
                 t2.side as side2,
                 t1.rpnl as rpnl1,
                 t2.rpnl as rpnl2,
-                ABS(epoch(t1.open_ts - t2.open_ts)) AS open_time_diff_sec,
-                ABS(epoch(t1.closing_ts - t2.closing_ts)) AS close_time_diff_sec
+                ABS(epoch(t1.open_ts) - epoch(t2.open_ts)) AS open_time_diff_sec,
+                ABS(epoch(t1.closing_ts) - epoch(t2.closing_ts)) AS close_time_diff_sec
             FROM position t1 
             INNER JOIN position t2 ON
                 t1.symbol = t2.symbol
-                AND ABS(epoch(t1.open_ts - t2.open_ts)) <= {self.config.max_open_time_diff_min * 60}
-                AND ABS(epoch(t1.closing_ts - t2.closing_ts)) <= {self.config.max_close_time_diff_min * 60}
+                AND ABS(epoch(t1.open_ts) - epoch(t2.open_ts)) <= {self.config.max_open_time_diff_min * 60}
+                AND ABS(epoch(t1.closing_ts) - epoch(t2.closing_ts)) <= {self.config.max_close_time_diff_min * 60}
                 AND t1.open_ts < t2.open_ts
                 AND GREATEST(t1.open_ts, t2.open_ts) < LEAST(t1.closing_ts, t2.closing_ts)
                 AND t1.account_id != t2.account_id
@@ -603,9 +609,26 @@ class NetworkAnalyzer:
                 if p.account_id1 in group_set or p.account_id2 in group_set
             ]
             
-            # PnL 계산
-            total_pos = sum(max(0, p.rpnl1) + max(0, p.rpnl2) for p in group_pairs)
-            total_neg = sum(min(0, p.rpnl1) + min(0, p.rpnl2) for p in group_pairs)
+            # PnL 계산 (position_id 중복 제거)
+            # AD_2.py 로직 참고: 동일 position_id가 여러 pair에 나타날 수 있어 중복 제거 필요
+            unique_rpnl = []
+            
+            # position_id1들의 rpnl (중복 제거)
+            seen_position_ids = set()
+            for p in group_pairs:
+                if p.position_id1 not in seen_position_ids:
+                    unique_rpnl.append(p.rpnl1)
+                    seen_position_ids.add(p.position_id1)
+            
+            # position_id2들의 rpnl (중복 제거)
+            for p in group_pairs:
+                if p.position_id2 not in seen_position_ids:
+                    unique_rpnl.append(p.rpnl2)
+                    seen_position_ids.add(p.position_id2)
+            
+            # 합계 계산
+            total_pos = sum(max(0, rpnl) for rpnl in unique_rpnl)
+            total_neg = sum(min(0, rpnl) for rpnl in unique_rpnl)
             total_pnl = total_pos + total_neg
             
             # IP 공유 분석

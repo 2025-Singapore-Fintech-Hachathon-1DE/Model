@@ -1,7 +1,12 @@
 """
 Funding Hunter Detection System (펀딩비 악용 탐지 시스템)
-Version: 2.0
+Version: 2.1
 Author: Singapore Fintech Hackathon Team
+
+주요 개선 사항 (v2.1):
+1. SQL 쿼리 시간 계산 검증 완료 (epoch 함수 사용)
+2. Funding 데이터는 position_id가 없어 account_id 레벨에서 집계 (정상)
+3. AD_2.py 로직과 일치하는 시간대 변경 감지 로직 확인
 
 탐지 대상: 펀딩비 정산 시점을 노린 고빈도 포지션 개폐 패턴
 """
@@ -100,7 +105,8 @@ class FundingHunterCase:
     # 펀딩 정보
     fund_period_hr: int
     closing_hour: int
-    total_funding: float
+    account_total_funding: float
+    window_funding: float
     
     # 포지션 크기
     max_order_amount: float
@@ -129,6 +135,8 @@ class AccountSummary:
     account_id: str
     total_cases: int = 0
     total_funding_profit: float = 0.0
+    account_total_funding: float = 0.0
+    merged_interval_count: int = 0
     avg_score: float = 0.0
     max_score: float = 0.0
     critical_count: int = 0
@@ -193,7 +201,12 @@ class DetectionLogger:
         self.logger.warning(f"  - 계정: {case.account_id}")
         self.logger.warning(f"  - 심각도: {case.severity.value}")
         self.logger.warning(f"  - 점수: {case.score.total:.2f}")
-        self.logger.warning(f"  - 펀딩비 수익: ${case.total_funding:.2f}")
+        self.logger.warning(
+            f"  - 펀딩비 수익(윈도우): ${case.window_funding:.2f}"
+        )
+        self.logger.warning(
+            f"  - 계정 총 펀딩비 수익: ${case.account_total_funding:.2f}"
+        )
 
 
 # ============================================================================
@@ -242,7 +255,7 @@ class CandidateExtractor:
         funding_agg AS (
             SELECT
                 account_id,
-                -SUM(funding_fee) AS total_funding
+                -SUM(funding_fee) AS account_total_funding
             FROM Funding
             GROUP BY account_id
         ),
@@ -256,16 +269,24 @@ class CandidateExtractor:
                 ct.closing_ts,
                 ct.leverage,
                 ct.amount,
-                fa.total_funding,
+                fa.account_total_funding,
                 (epoch(ct.closing_ts) - epoch(ct.open_ts)) / 60.0 AS holding_minutes,
                 sc.fund_period_hr,
                 sc.max_order_amount,
                 CAST(STRFTIME('%H', ct.closing_ts) AS INTEGER) AS closing_hour,
-                CAST(STRFTIME('%H', ct.open_ts) AS INTEGER) AS opening_hour
+                CAST(STRFTIME('%H', ct.open_ts) AS INTEGER) AS opening_hour,
+                COALESCE(fw.window_funding, 0) AS window_funding
             FROM position ct
             LEFT JOIN funding_agg fa ON ct.account_id = fa.account_id
             LEFT JOIN spec_clean sc
                 ON ct.symbol = sc.symbol AND ct.closing_day = sc.spec_day
+            LEFT JOIN LATERAL (
+                SELECT SUM(-funding_fee) AS window_funding
+                FROM Funding f
+                WHERE f.account_id = ct.account_id
+                  AND CAST(f.ts AS TIMESTAMP) >= ct.open_ts
+                  AND CAST(f.ts AS TIMESTAMP) <= ct.closing_ts
+            ) fw ON TRUE
         )
         SELECT 
             account_id,
@@ -276,7 +297,8 @@ class CandidateExtractor:
             closing_ts,
             leverage,
             amount,
-            total_funding,
+            account_total_funding,
+            window_funding,
             holding_minutes,
             fund_period_hr,
             max_order_amount,
@@ -285,11 +307,11 @@ class CandidateExtractor:
             amount / NULLIF(max_order_amount, 0) AS amount_ratio
         FROM joined
         WHERE 
-            total_funding > 0
+            window_funding > 0
             AND fund_period_hr IS NOT NULL
             AND max_order_amount IS NOT NULL
             AND closing_hour % fund_period_hr = 0
-        ORDER BY total_funding DESC, holding_minutes ASC
+        ORDER BY window_funding DESC, holding_minutes ASC
         """
         
         df = self.con.execute(query).fetchdf()
@@ -389,7 +411,8 @@ class FilterEngine:
             holding_minutes=row['holding_minutes'],
             fund_period_hr=row['fund_period_hr'],
             closing_hour=row['closing_hour'],
-            total_funding=row['total_funding'],
+            account_total_funding=row.get('account_total_funding', 0.0),
+            window_funding=row.get('window_funding', 0.0),
             max_order_amount=row['max_order_amount'],
             amount_ratio=row['amount_ratio'],
         )
@@ -443,7 +466,7 @@ class ScoringEngine:
     def _score_funding_profit(self, case: FundingHunterCase) -> float:
         """펀딩비 수익 점수 (40점)"""
         max_weight = self.config.weight_funding_profit
-        profit = case.total_funding
+        profit = case.window_funding
         
         if profit >= 1000:
             return max_weight
@@ -536,7 +559,10 @@ class AccountAnalyzer:
             
             summary = account_map[account_id]
             summary.total_cases += 1
-            summary.total_funding_profit += case.total_funding
+            summary.total_funding_profit += case.window_funding
+            summary.account_total_funding = max(
+                summary.account_total_funding, case.account_total_funding
+            )
             summary.case_ids.append(case.case_id)
             
             if case.severity == SeverityLevel.CRITICAL:
@@ -615,7 +641,8 @@ class ReportGenerator:
                 'side': case.side,
                 'leverage': case.leverage,
                 'amount': case.amount,
-                'total_funding': case.total_funding,
+                'window_funding': case.window_funding,
+                'account_total_funding': case.account_total_funding,
                 'holding_minutes': case.holding_minutes,
                 'amount_ratio': case.amount_ratio,
                 'fund_period_hr': case.fund_period_hr,
@@ -682,7 +709,12 @@ class ReportGenerator:
                 'medium': severity_counts.get('MEDIUM', 0),
                 'low': severity_counts.get('LOW', 0),
                 'total_accounts': len(account_summaries),
-                'total_funding_profit': sum(s.total_funding_profit for s in account_summaries.values()),
+                'total_funding_profit': sum(
+                    s.total_funding_profit for s in account_summaries.values()
+                ),
+                'total_account_funding': sum(
+                    s.account_total_funding for s in account_summaries.values()
+                ),
             },
             'severity_distribution': dict(severity_counts),
             'score_distribution': dict(score_distribution),
@@ -709,6 +741,10 @@ class ReportGenerator:
             severity_counts[case.severity] += 1
         
         total_funding = sum(s.total_funding_profit for s in account_summaries.values())
+        total_account_funding = sum(
+            s.account_total_funding for s in account_summaries.values()
+        )
+        account_count = max(len(account_summaries), 1)
         
         # 상위 계정
         top_accounts = sorted(
@@ -730,16 +766,18 @@ class ReportGenerator:
   - Low (낮은 의심): {severity_counts[SeverityLevel.LOW]}건
 
 💰 펀딩비 악용 규모
-  - 총 펀딩비 수익: ${total_funding:,.2f}
-  - 연루 계정 수: {len(account_summaries)}개
-  - 평균 계정당 수익: ${total_funding/len(account_summaries):,.2f}
+    - 탐지 윈도우 총 수익: ${total_funding:,.2f}
+    - 계정별 총 펀딩비 합계: ${total_account_funding:,.2f}
+    - 연루 계정 수: {len(account_summaries)}개
+        - 평균 계정당 수익: ${total_funding/account_count:,.2f}
 
 🎯 상위 계정 (Top 10)
 """
         
         for idx, acc in enumerate(top_accounts, 1):
             report += f"""  {idx}. {acc.account_id}
-     - 총 수익: ${acc.total_funding_profit:,.2f}
+            - 윈도우 수익 합계: ${acc.total_funding_profit:,.2f}
+            - 계정 총 펀딩비: ${acc.account_total_funding:,.2f}
      - 탐지 횟수: {acc.total_cases}건
      - 평균 점수: {acc.avg_score:.1f}
      - Critical: {acc.critical_count}건, High: {acc.high_count}건
