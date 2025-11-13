@@ -19,7 +19,7 @@ from pathlib import Path
 from enum import Enum
 import logging
 from collections import defaultdict, Counter
-from common.data_manager import get_data_manager
+# Detectors read model tables directly from the persistent DuckDB file
 
 # ============================================================================
 # 1. CONFIGURATION & TYPES
@@ -925,9 +925,16 @@ class CooperativeTradingDetector:
         
         # 1. 데이터 로드 (공통 DataManager 사용)
         self.logger.log_phase("데이터 로드")
-        dm = get_data_manager(data_filepath)
-        data = dm.get_all_sheets()
-        con = dm.get_connection()
+        # detectors should use the persistent DuckDB file created by main
+        db_path = Path.cwd() / 'data' / 'ingest.duckdb'
+        con = dd.connect(database=str(db_path))
+
+        # load auxiliary tables used by non-SQL parts of the detector
+        data = {}
+        try:
+            data['IP'] = con.execute('SELECT * FROM "IP"').fetchdf()
+        except Exception:
+            data['IP'] = pd.DataFrame()
         
         # 2. 후보 추출
         self.logger.log_phase("후보 거래 쌍 추출")

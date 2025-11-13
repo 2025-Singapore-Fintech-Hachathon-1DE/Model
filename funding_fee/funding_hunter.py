@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from enum import Enum
 import logging
-from common.data_manager import get_data_manager
+# detectors read model tables directly from persistent DuckDB file created by main
 
 # ============================================================================
 # 1. CONFIGURATION & TYPES
@@ -800,9 +800,9 @@ class FundingHunterDetector:
         
         # 1. 데이터 로드 (공통 DataManager 사용)
         self.logger.log_phase("데이터 로드")
-        dm = get_data_manager(data_filepath)
-        data = dm.get_all_sheets()
-        con = dm.get_connection()
+        # detectors should use the persistent DuckDB file created by main
+        db_path = Path.cwd() / 'data' / 'ingest.duckdb'
+        con = dd.connect(database=str(db_path))
         
         # 2. 후보 추출
         self.logger.log_phase("후보 케이스 추출")

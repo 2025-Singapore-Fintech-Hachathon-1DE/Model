@@ -29,6 +29,16 @@ def run_all_detections(data_filepath: str = "problem_data_final.xlsx"):
     print("="*80 + "\n")
     
     results = {}
+
+    # --- Initialize DataManager: persist full tables and seed March 2025 model tables
+    try:
+        from common.data_manager import get_data_manager
+        dm = get_data_manager(data_filepath)
+        # persist full tables and seed model tables for March 2025
+        dm.seed_full_and_model(year=2025, month=3)
+        print("DataManager: persisted full tables and seeded March 2025 model tables into DuckDB.")
+    except Exception as e:
+        print(f"DataManager initialization failed: {e}")
     
     # 1. Bonus Laundering 탐지
     print("\n" + "🎁 " + "="*76)

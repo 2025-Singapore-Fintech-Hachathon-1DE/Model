@@ -28,6 +28,7 @@ import pandas as pd
 import duckdb
 import threading
 from datetime import datetime, timedelta
+from typing import List
 
 
 class DataManager:
@@ -58,6 +59,9 @@ class DataManager:
         self._load_called = False
 
         # DuckDB connection (in-memory) - created lazily when requested
+        # default persistent duckdb path for sharing between main and detectors
+        self.duckdb_path: Path = Path.cwd() / "data" / "ingest.duckdb"
+        self.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
         self._con: Optional[duckdb.DuckDBPyConnection] = None
         self._registered: Dict[str, bool] = {}
 
@@ -112,6 +116,17 @@ class DataManager:
             self.sheets = {}
         self._load_called = True
 
+    # ----------------------------- New helpers -----------------------------
+    def _normalize_name(self, name: str) -> str:
+        """Normalize sheet name for use in persistent table names."""
+        return name.strip().lower().replace(' ', '_')
+
+    def _full_table_name(self, name: str) -> str:
+        return f"full_data_{self._normalize_name(name)}"
+
+    def _model_table_name(self, name: str) -> str:
+        return f"{name}"
+
     def ensure_loaded(self, filepath: Optional[str] = None):
         if filepath:
             self.filepath = Path(filepath)
@@ -132,7 +147,8 @@ class DataManager:
         if not self._load_called:
             self._load()
 
-        con = self.get_connection()
+        # Use persistent duckdb connection for registration
+        con = self.get_connection(persistent=True)
 
         sheet_list = sheets if sheets is not None else list(self.sheets.keys())
         for name in sheet_list:
@@ -154,6 +170,7 @@ class DataManager:
                 max_ts = df[ts_col].max()
                 cutoff = max_ts - timedelta(days=initial_days)
                 subset = df[df[ts_col] >= cutoff].copy()
+                # register subset into in-memory registered connection
                 con.register(name, subset)
                 self.last_loaded[name] = subset[ts_col].max() if not subset.empty else None
                 self._registered[name] = True
@@ -224,13 +241,20 @@ class DataManager:
             self._load()
         return self.sheets
 
-    def get_connection(self) -> duckdb.DuckDBPyConnection:
-        """Return a DuckDB connection with loaded DataFrames registered.
+    def get_connection(self, persistent: bool = False) -> duckdb.DuckDBPyConnection:
+        """Return a DuckDB connection.
 
-        The connection is created and tables are registered on first call.
-        Subsequent calls return the same connection (tables already
-        registered).
+        By default returns an in-memory connection (used by older callers).
+        If `persistent=True` the connection is created against a file at
+        `self.duckdb_path` so other processes/modules can reopen the same
+        DB file and read tables.
         """
+        if persistent:
+            if self._con is None:
+                self._con = duckdb.connect(database=str(self.duckdb_path))
+            return self._con
+
+        # in-memory connection (backwards-compatible)
         if self._con is None:
             self._con = duckdb.connect(database=':memory:')
             # register DataFrames as tables
@@ -238,12 +262,140 @@ class DataManager:
                 self._load()
             for name, df in self.sheets.items():
                 try:
-                    # duckdb requires str table names without spaces; keep as-is
                     self._con.register(name, df)
                 except Exception:
-                    # ignore registration errors for now
                     pass
         return self._con
+
+    # ---------------------- Persistent full/model workflow -----------------
+    def seed_full_and_model(self, year: int = 2025, month: int = 3, sheets: Optional[List[str]] = None):
+        """Persist full sheet tables and create model-use tables seeded to a given month.
+
+        - Writes each loaded sheet into a persistent table named
+          `full_data_<sheetname>` in the DuckDB file.
+        - Creates/Replaces a working table with the original sheet name
+          that contains only rows for the requested year/month (model data).
+        """
+        if not self._load_called:
+            self._load()
+
+        con = self.get_connection(persistent=True)
+        sheet_list = sheets if sheets is not None else list(self.sheets.keys())
+
+        start = datetime(year, month, 1)
+        if month == 12:
+            end = datetime(year + 1, 1, 1)
+        else:
+            end = datetime(year, month + 1, 1)
+
+        for name in sheet_list:
+            df = self.sheets.get(name)
+            if df is None:
+                continue
+
+            full_name = self._full_table_name(name)
+            # register temporary and materialize persistent full table
+            try:
+                con.register('tmp_df', df)
+                con.execute(f'CREATE OR REPLACE TABLE "{full_name}" AS SELECT * FROM tmp_df')
+                try:
+                    con.unregister('tmp_df')
+                except Exception:
+                    pass
+            except Exception:
+                # fallback: continue
+                continue
+
+            ts_col = self.timestamp_cols.get(name)
+            # if timestamp column exists, create model table for month window
+            if ts_col and ts_col in df.columns:
+                # ensure type in DB by casting in query
+                start_s = start.isoformat()
+                end_s = end.isoformat()
+                try:
+                    con.execute(
+                        f'CREATE OR REPLACE TABLE "{name}" AS '
+                        f'SELECT * FROM "{full_name}" WHERE CAST({ts_col} AS TIMESTAMP) >= TIMESTAMP \"{start_s}\" '
+                        f'AND CAST({ts_col} AS TIMESTAMP) < TIMESTAMP \"{end_s}\"'
+                    )
+                    # record last_loaded as end of month - 1 microsecond
+                    last = df[ts_col].dropna().max()
+                    if pd.notna(last):
+                        # set last_loaded to last timestamp within the model table if exists
+                        res = con.execute(f'SELECT MAX(CAST({ts_col} AS TIMESTAMP)) AS m FROM "{name}"').fetchone()
+                        self.last_loaded[name] = res[0] if res else None
+                        self._registered[name] = True
+                except Exception:
+                    # if filtering fails, fallback to copying full
+                    con.execute(f'CREATE OR REPLACE TABLE "{name}" AS SELECT * FROM "{full_name}"')
+                    self.last_loaded[name] = None
+                    self._registered[name] = True
+            else:
+                # no timestamp - copy full into working table
+                try:
+                    con.execute(f'CREATE OR REPLACE TABLE "{name}" AS SELECT * FROM "{full_name}"')
+                    self.last_loaded[name] = None
+                    self._registered[name] = True
+                except Exception:
+                    pass
+
+    def advance_model_by_days(self, days: int = 7, sheets: Optional[List[str]] = None):
+        """Advance model tables by appending rows from full tables up to N days.
+
+        For each sheet with a timestamp column, finds the current max timestamp
+        in the working table and appends rows from the corresponding full table
+        where prev < ts <= prev + days.
+        """
+        if not self._load_called:
+            self._load()
+        con = self.get_connection(persistent=True)
+        sheet_list = sheets if sheets is not None else list(self.sheets.keys())
+
+        for name in sheet_list:
+            full_name = self._full_table_name(name)
+            ts_col = self.timestamp_cols.get(name)
+            if ts_col is None:
+                continue
+
+            # get prev max from working table
+            try:
+                prev_row = con.execute(f'SELECT MAX(CAST({ts_col} AS TIMESTAMP)) FROM "{name}"').fetchone()
+                prev = prev_row[0] if prev_row else None
+            except Exception:
+                prev = None
+
+            # determine upper bound
+            if prev is None:
+                # start from -inf -> fetch up to earliest prev + days meaning take up to start of month + days
+                # here treat as fetch until first full table max constrained by days from min date
+                bound_row = con.execute(f'SELECT MIN(CAST({ts_col} AS TIMESTAMP)) FROM "{full_name}"').fetchone()
+                lower = bound_row[0] if bound_row else None
+                if lower is None:
+                    continue
+                prev_dt = pd.to_datetime(lower)
+            else:
+                prev_dt = pd.to_datetime(prev)
+
+            up_to = prev_dt + timedelta(days=days)
+            up_to_s = up_to.isoformat()
+            prev_s = prev_dt.isoformat()
+
+            # insert rows from full table into working table
+            try:
+                # create working table if missing
+                con.execute(f'CREATE TABLE IF NOT EXISTS "{name}" AS SELECT * FROM "{full_name}" WHERE 1=0')
+                con.execute(
+                    f'INSERT INTO "{name}" '
+                    f'SELECT * FROM "{full_name}" WHERE CAST({ts_col} AS TIMESTAMP) > TIMESTAMP \"{prev_s}\" '
+                    f'AND CAST({ts_col} AS TIMESTAMP) <= TIMESTAMP \"{up_to_s}\"'
+                )
+                # update last_loaded
+                res = con.execute(f'SELECT MAX(CAST({ts_col} AS TIMESTAMP)) FROM "{name}"').fetchone()
+                self.last_loaded[name] = res[0] if res else None
+                self._registered[name] = True
+            except Exception:
+                # best-effort: continue
+                continue
 
 
 _GLOBAL_MANAGER: Optional[DataManager] = None

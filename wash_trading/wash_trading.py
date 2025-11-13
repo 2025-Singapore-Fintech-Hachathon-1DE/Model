@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from enum import Enum
 import logging
-from common.data_manager import get_data_manager
+# detectors read model tables directly from persistent DuckDB file created by main
 from collections import defaultdict
 
 # ============================================================================
@@ -1080,10 +1080,9 @@ class BonusLaunderingDetector:
         """
         print("데이터 로드")
         
-        # 1. 데이터 로드 (공통 DataManager 사용)
-        dm = get_data_manager(data_filepath)
-        dm.get_all_sheets()
-        con = dm.get_connection()
+        # 1. 데이터 로드 — detectors read from the persistent DuckDB file
+        db_path = Path.cwd() / 'data' / 'ingest.duckdb'
+        con = dd.connect(database=str(db_path))
         
         # 2. 포지션 구성
         print("포지션 구성")
