@@ -19,6 +19,7 @@ from enum import Enum
 import logging
 # detectors read model tables directly from persistent DuckDB file created by main
 from collections import defaultdict
+from common.data_manager import get_data_manager
 
 # ============================================================================
 # 1. CONFIGURATION & TYPES
@@ -1080,9 +1081,10 @@ class BonusLaunderingDetector:
         """
         print("데이터 로드")
         
-        # 1. 데이터 로드 — detectors read from the persistent DuckDB file
-        db_path = Path.cwd() / 'data' / 'ingest.duckdb'
-        con = dd.connect(database=str(db_path))
+        # 1. 데이터 로드 — use DataManager to get persistent connection with model tables
+        dm = get_data_manager(data_filepath)
+        dm.ensure_loaded(data_filepath)
+        con = dm.get_connection()
         
         # 2. 포지션 구성
         print("포지션 구성")

@@ -30,13 +30,13 @@ def run_all_detections(data_filepath: str = "problem_data_final.xlsx"):
     
     results = {}
 
-    # --- Initialize DataManager: persist full tables and seed March 2025 model tables
+    # --- Initialize DataManager: DO NOT seed_full_and_model here
+    # DataManager initialization is handled by main.py or simulation API
+    # This script only runs detection on existing model tables
     try:
         from common.data_manager import get_data_manager
         dm = get_data_manager(data_filepath)
-        # persist full tables and seed model tables for March 2025
-        dm.seed_full_and_model(year=2025, month=3)
-        print("DataManager: persisted full tables and seeded March 2025 model tables into DuckDB.")
+        print("DataManager: connected to existing database.")
     except Exception as e:
         print(f"DataManager initialization failed: {e}")
     
@@ -124,6 +124,7 @@ def run_all_detections(data_filepath: str = "problem_data_final.xlsx"):
     print("\n" + "="*80)
     print(f"종료 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*80 + "\n")
+
     
     return results
 
